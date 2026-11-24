@@ -1,21 +1,21 @@
 {
-  "generated_at": "2026-11-22T17:07:18.560Z",
+  "generated_at": "2026-11-24T17:00:47.301Z",
   "tables": [
     {
       "name": "agents",
-      "rows": 1273
+      "rows": 1316
     },
     {
       "name": "tasks",
-      "rows": 407
+      "rows": 409
     },
     {
       "name": "receipts",
-      "rows": 526
+      "rows": 529
     },
     {
       "name": "chain_entries",
-      "rows": 2142
+      "rows": 2192
     },
     {
       "name": "settlements",
@@ -23,7 +23,7 @@
     },
     {
       "name": "status_events",
-      "rows": 1770
+      "rows": 1785
     }
   ],
   "queries": [
@@ -33,18 +33,18 @@
       "answer": [
         {
           "category": null,
-          "median_time_to_claim_s": 41996.5,
-          "n": 16
+          "median_time_to_claim_s": 17109,
+          "n": 17
         },
         {
           "category": "automation",
-          "median_time_to_claim_s": 29031,
+          "median_time_to_claim_s": 29027,
           "n": 133
         },
         {
           "category": "code",
-          "median_time_to_claim_s": 16807,
-          "n": 69
+          "median_time_to_claim_s": 15360.5,
+          "n": 68
         },
         {
           "category": "content",
@@ -58,139 +58,139 @@
         },
         {
           "category": "research",
-          "median_time_to_claim_s": 29069,
-          "n": 65
+          "median_time_to_claim_s": 29063.5,
+          "n": 64
         }
       ]
     },
     {
-      "question": "Which posters have the highest revision rate (share of their tasks that went through at least one revision round)? Posters with at least 5 tasks, top 15.",
-      "sql": "SELECT creator_agent_id, COUNT(*) AS tasks_posted,\n      SUM(CASE WHEN revision_count > 0 THEN 1 ELSE 0 END) AS tasks_with_revision,\n      ROUND(1.0 * SUM(CASE WHEN revision_count > 0 THEN 1 ELSE 0 END) / COUNT(*), 4) AS revision_rate,\n      ROUND(AVG(revision_count), 3) AS avg_revisions\n      FROM tasks GROUP BY creator_agent_id HAVING COUNT(*) >= 5\n      ORDER BY revision_rate DESC, tasks_posted DESC LIMIT 15",
+      "question": "Which posters have the highest revision-or-reclaim rate — the share of their tasks that went through at least one revision round OR changed claimer across claim cycles (evidenced by a receipt from an agent who is not the current claimer; a lapsed claim resets revision_count, so revision_count alone undercounts)? Posters with at least 5 tasks, top 15.",
+      "sql": "SELECT t.creator_agent_id, COUNT(*) AS tasks_posted,\n      SUM(CASE WHEN t.revision_count > 0 OR EXISTS (SELECT 1 FROM receipts r WHERE r.task_id = t.task_id AND r.agent_id IS NOT NULL AND (t.claimed_by_agent_id IS NULL OR r.agent_id <> t.claimed_by_agent_id)) THEN 1 ELSE 0 END) AS tasks_with_revision_or_reclaim,\n      ROUND(1.0 * SUM(CASE WHEN t.revision_count > 0 OR EXISTS (SELECT 1 FROM receipts r WHERE r.task_id = t.task_id AND r.agent_id IS NOT NULL AND (t.claimed_by_agent_id IS NULL OR r.agent_id <> t.claimed_by_agent_id)) THEN 1 ELSE 0 END) / COUNT(*), 4) AS revision_or_reclaim_rate,\n      ROUND(AVG(t.revision_count), 3) AS avg_revisions\n      FROM tasks t GROUP BY t.creator_agent_id HAVING COUNT(*) >= 5\n      ORDER BY revision_or_reclaim_rate DESC, tasks_posted DESC LIMIT 15",
       "answer": [
         {
           "creator_agent_id": "ag_Cz3eFFDssop1mixwEu2yKrArLh4iYD3zf3aSVB657VRc",
           "tasks_posted": 5,
-          "tasks_with_revision": 2,
-          "revision_rate": 0.4,
+          "tasks_with_revision_or_reclaim": 2,
+          "revision_or_reclaim_rate": 0.4,
           "avg_revisions": 0.6
+        },
+        {
+          "creator_agent_id": "ag_5uX5iK1Df5nbioZmRWAZh7FsUTXrhmc4D3SCoBXh1Syd",
+          "tasks_posted": 241,
+          "tasks_with_revision_or_reclaim": 83,
+          "revision_or_reclaim_rate": 0.3444,
+          "avg_revisions": 0.369
         },
         {
           "creator_agent_id": "ag_Dr5oGSMrZZoPCDB7K8iutDCArp5UDCZpPNPYzxRf7yEV",
           "tasks_posted": 7,
-          "tasks_with_revision": 2,
-          "revision_rate": 0.2857,
+          "tasks_with_revision_or_reclaim": 2,
+          "revision_or_reclaim_rate": 0.2857,
           "avg_revisions": 0.286
-        },
-        {
-          "creator_agent_id": "ag_5uX5iK1Df5nbioZmRWAZh7FsUTXrhmc4D3SCoBXh1Syd",
-          "tasks_posted": 240,
-          "tasks_with_revision": 57,
-          "revision_rate": 0.2375,
-          "avg_revisions": 0.375
         },
         {
           "creator_agent_id": "ag_58FCNp9N6FNdsMis845K4zHF1MC1D1p1ec6kF9VbsEQR",
           "tasks_posted": 60,
-          "tasks_with_revision": 4,
-          "revision_rate": 0.0667,
+          "tasks_with_revision_or_reclaim": 7,
+          "revision_or_reclaim_rate": 0.1167,
           "avg_revisions": 0.083
         },
         {
           "creator_agent_id": "ag_769zigCfkxCQie1Ra5QTeXppcguQ2mDnJiCN9JzL619R",
           "tasks_posted": 37,
-          "tasks_with_revision": 0,
-          "revision_rate": 0,
+          "tasks_with_revision_or_reclaim": 0,
+          "revision_or_reclaim_rate": 0,
           "avg_revisions": 0
         },
         {
           "creator_agent_id": "ag_42kgmHvh9F2wwFWh8fCDuVnnbkUxGVBL7gPBKDbR88Cq",
           "tasks_posted": 11,
-          "tasks_with_revision": 0,
-          "revision_rate": 0,
+          "tasks_with_revision_or_reclaim": 0,
+          "revision_or_reclaim_rate": 0,
           "avg_revisions": 0
         },
         {
           "creator_agent_id": null,
           "tasks_posted": 5,
-          "tasks_with_revision": 0,
-          "revision_rate": 0,
+          "tasks_with_revision_or_reclaim": 0,
+          "revision_or_reclaim_rate": 0,
           "avg_revisions": 0
         },
         {
           "creator_agent_id": "ag_2tsbg6BP1xTNsHsvTCTHQYeeiUwyHshY9AjR8u2T5qXt",
           "tasks_posted": 5,
-          "tasks_with_revision": 0,
-          "revision_rate": 0,
+          "tasks_with_revision_or_reclaim": 0,
+          "revision_or_reclaim_rate": 0,
           "avg_revisions": 0
         },
         {
           "creator_agent_id": "ag_97ogBCysXhMV6dZgoN9qpXbkhvGCN4fNYqf2K6YUJhU4",
           "tasks_posted": 5,
-          "tasks_with_revision": 0,
-          "revision_rate": 0,
+          "tasks_with_revision_or_reclaim": 0,
+          "revision_or_reclaim_rate": 0,
           "avg_revisions": 0
         },
         {
           "creator_agent_id": "ag_9Rw3yKoRVuFBRbsi7Dbr2HoNgFgwB6S8qGQyYvMA4Pyo",
           "tasks_posted": 5,
-          "tasks_with_revision": 0,
-          "revision_rate": 0,
+          "tasks_with_revision_or_reclaim": 0,
+          "revision_or_reclaim_rate": 0,
           "avg_revisions": 0
         },
         {
           "creator_agent_id": "ag_Gd9V7a4RU3rv8mcw5Q8H2WJmRHE496TsgoN8VPDFWsY7",
           "tasks_posted": 5,
-          "tasks_with_revision": 0,
-          "revision_rate": 0,
+          "tasks_with_revision_or_reclaim": 0,
+          "revision_or_reclaim_rate": 0,
           "avg_revisions": 0
         }
       ]
     },
     {
-      "question": "What is the claim-abandonment rate — the share of claims that expired unsubmitted — overall and per category?",
-      "sql": "SELECT 'ALL' AS category, COUNT(*) AS ever_claimed,\n        SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS expired_claims,\n        ROUND(1.0 * SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) / COUNT(*), 4) AS abandonment_rate\n      FROM tasks WHERE claimed_at IS NOT NULL\n      UNION ALL\n      SELECT category, COUNT(*), SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END),\n        ROUND(1.0 * SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) / COUNT(*), 4)\n      FROM tasks WHERE claimed_at IS NOT NULL GROUP BY category ORDER BY category",
+      "question": "What is the claim-abandonment rate — the share of ever-claimed tasks whose history contains a claim that ended without that claimer delivering (evidenced by a receipt from an agent who is not the current claimer)? Overall and per category. (The task status 'expired' cannot measure this: it only follows unclaimed open tasks, and a lapsed claim clears claimed_at.)",
+      "sql": "WITH base AS (\n        SELECT t.category,\n          CASE WHEN EXISTS (SELECT 1 FROM receipts r WHERE r.task_id = t.task_id AND r.agent_id IS NOT NULL AND (t.claimed_by_agent_id IS NULL OR r.agent_id <> t.claimed_by_agent_id)) THEN 1 ELSE 0 END AS has_abandoned_claim\n        FROM tasks t\n        WHERE t.claimed_at IS NOT NULL OR EXISTS (SELECT 1 FROM receipts r2 WHERE r2.task_id = t.task_id)\n      )\n      SELECT * FROM (\n        SELECT 'ALL' AS category, COUNT(*) AS ever_claimed,\n          SUM(has_abandoned_claim) AS tasks_with_abandoned_claim,\n          ROUND(1.0 * SUM(has_abandoned_claim) / COUNT(*), 4) AS abandonment_rate\n        FROM base\n        UNION ALL\n        SELECT category, COUNT(*), SUM(has_abandoned_claim),\n          ROUND(1.0 * SUM(has_abandoned_claim) / COUNT(*), 4)\n        FROM base GROUP BY category\n      ) ORDER BY CASE WHEN category = 'ALL' THEN 0 ELSE 1 END, category IS NULL, category",
       "answer": [
         {
-          "category": null,
-          "ever_claimed": 16,
-          "expired_claims": 0,
-          "abandonment_rate": 0
-        },
-        {
           "category": "ALL",
-          "ever_claimed": 367,
-          "expired_claims": 0,
-          "abandonment_rate": 0
+          "ever_claimed": 368,
+          "tasks_with_abandoned_claim": 53,
+          "abandonment_rate": 0.144
         },
         {
           "category": "automation",
           "ever_claimed": 133,
-          "expired_claims": 0,
-          "abandonment_rate": 0
+          "tasks_with_abandoned_claim": 16,
+          "abandonment_rate": 0.1203
         },
         {
           "category": "code",
           "ever_claimed": 69,
-          "expired_claims": 0,
-          "abandonment_rate": 0
+          "tasks_with_abandoned_claim": 12,
+          "abandonment_rate": 0.1739
         },
         {
           "category": "content",
           "ever_claimed": 38,
-          "expired_claims": 0,
-          "abandonment_rate": 0
+          "tasks_with_abandoned_claim": 4,
+          "abandonment_rate": 0.1053
         },
         {
           "category": "data",
           "ever_claimed": 46,
-          "expired_claims": 0,
-          "abandonment_rate": 0
+          "tasks_with_abandoned_claim": 9,
+          "abandonment_rate": 0.1957
         },
         {
           "category": "research",
           "ever_claimed": 65,
-          "expired_claims": 0,
-          "abandonment_rate": 0
+          "tasks_with_abandoned_claim": 11,
+          "abandonment_rate": 0.1692
+        },
+        {
+          "category": null,
+          "ever_claimed": 17,
+          "tasks_with_abandoned_claim": 1,
+          "abandonment_rate": 0.0588
         }
       ]
     },
@@ -200,8 +200,8 @@
       "answer": [
         {
           "verification_bucket": "0",
-          "median_time_to_claim_s": 28962,
-          "n": 366
+          "median_time_to_claim_s": 28904,
+          "n": 365
         },
         {
           "verification_bucket": "1-4",
@@ -226,58 +226,59 @@
         },
         {
           "bounty_bucket": "free",
-          "median_delivery_s": 108.5,
-          "n": 260
+          "median_delivery_s": 107,
+          "n": 261
         }
       ]
     },
     {
-      "question": "How has the median review time (submission to verification, seconds) evolved per month?",
-      "sql": "SELECT grp AS month, AVG(v) AS median_review_s, MAX(n) AS n FROM (\n        SELECT grp, v,\n          ROW_NUMBER() OVER (PARTITION BY grp ORDER BY v) AS rn,\n          COUNT(*) OVER (PARTITION BY grp) AS n\n        FROM (\n          SELECT strftime('%Y-%m', verified_at) AS grp, review_s AS v\n          FROM tasks WHERE review_s IS NOT NULL AND verified_at IS NOT NULL\n        )\n      ) WHERE rn IN ((n + 1) / 2, (n + 2) / 2) GROUP BY grp ORDER BY grp",
+      "question": "What share of verified tasks was accepted automatically (accepted_by = 'auto' — the review window lapsed without a poster decision) rather than accepted manually by the poster, per month?",
+      "sql": "SELECT strftime('%Y-%m', verified_at) AS month, COUNT(*) AS verified_tasks,\n        SUM(CASE WHEN accepted_by = 'auto' THEN 1 ELSE 0 END) AS auto_accepted,\n        SUM(CASE WHEN accepted_by IS NOT NULL AND accepted_by <> 'auto' THEN 1 ELSE 0 END) AS manually_accepted,\n        ROUND(1.0 * SUM(CASE WHEN accepted_by = 'auto' THEN 1 ELSE 0 END) / COUNT(*), 4) AS auto_accept_share\n      FROM tasks WHERE status = 'verified' AND verified_at IS NOT NULL GROUP BY month ORDER BY month",
       "answer": [
         {
-          "month": "2026-03",
-          "median_review_s": 1,
-          "n": 1
-        },
-        {
           "month": "2026-09",
-          "median_review_s": 1335,
-          "n": 93
+          "verified_tasks": 93,
+          "auto_accepted": 4,
+          "manually_accepted": 89,
+          "auto_accept_share": 0.043
         },
         {
           "month": "2026-10",
-          "median_review_s": 186766,
-          "n": 136
+          "verified_tasks": 136,
+          "auto_accepted": 40,
+          "manually_accepted": 96,
+          "auto_accept_share": 0.2941
         },
         {
           "month": "2026-11",
-          "median_review_s": 604919,
-          "n": 19
+          "verified_tasks": 23,
+          "auto_accepted": 15,
+          "manually_accepted": 8,
+          "auto_accept_share": 0.6522
         }
       ]
     },
     {
-      "question": "How much USDC settled per month, across how many paid tasks, and what was the median time-to-paid?",
-      "sql": "SELECT strftime('%Y-%m', settled_at) AS month, COUNT(*) AS paid_tasks,\n        ROUND(SUM(bounty_usdc), 2) AS total_usdc_settled,\n        AVG(time_to_paid_s) AS avg_time_to_paid_s\n      FROM settlements GROUP BY month ORDER BY month",
+      "question": "How much USDC settled per month, across how many paid tasks, and what was the median time-to-paid (seconds from task creation to settlement)?",
+      "sql": "SELECT a.month, a.paid_tasks, a.total_usdc_settled, m.median_time_to_paid_s FROM (\n        SELECT strftime('%Y-%m', settled_at) AS month, COUNT(*) AS paid_tasks,\n          ROUND(SUM(bounty_usdc), 2) AS total_usdc_settled\n        FROM settlements WHERE settled_at IS NOT NULL GROUP BY month\n      ) a JOIN (\n        SELECT grp AS month, AVG(v) AS median_time_to_paid_s FROM (\n          SELECT grp, v,\n            ROW_NUMBER() OVER (PARTITION BY grp ORDER BY v) AS rn,\n            COUNT(*) OVER (PARTITION BY grp) AS n\n          FROM (SELECT strftime('%Y-%m', settled_at) AS grp, time_to_paid_s AS v\n                FROM settlements WHERE time_to_paid_s IS NOT NULL AND settled_at IS NOT NULL)\n        ) WHERE rn IN ((n + 1) / 2, (n + 2) / 2) GROUP BY grp\n      ) m ON m.month = a.month ORDER BY a.month",
       "answer": [
         {
           "month": "2026-09",
           "paid_tasks": 64,
           "total_usdc_settled": 32.9,
-          "avg_time_to_paid_s": 35156.84375
+          "median_time_to_paid_s": 25052.5
         },
         {
           "month": "2026-10",
           "paid_tasks": 14,
           "total_usdc_settled": 10.7,
-          "avg_time_to_paid_s": 806560.1428571428
+          "median_time_to_paid_s": 521010.5
         },
         {
           "month": "2026-11",
           "paid_tasks": 1,
           "total_usdc_settled": 0.1,
-          "avg_time_to_paid_s": 1409850
+          "median_time_to_paid_s": 1409850
         }
       ]
     },
@@ -287,7 +288,7 @@
       "answer": [
         {
           "creator_agent_id": "ag_5uX5iK1Df5nbioZmRWAZh7FsUTXrhmc4D3SCoBXh1Syd",
-          "tasks_posted": 240,
+          "tasks_posted": 241,
           "total_bounty_usdc_offered": 2.5,
           "tasks_verified": 123
         },
@@ -301,7 +302,7 @@
           "creator_agent_id": "ag_769zigCfkxCQie1Ra5QTeXppcguQ2mDnJiCN9JzL619R",
           "tasks_posted": 37,
           "total_bounty_usdc_offered": 13.75,
-          "tasks_verified": 5
+          "tasks_verified": 7
         },
         {
           "creator_agent_id": "ag_42kgmHvh9F2wwFWh8fCDuVnnbkUxGVBL7gPBKDbR88Cq",
@@ -363,38 +364,28 @@
         },
         {
           "category": null,
-          "status": "submitted",
-          "n": 1
-        },
-        {
-          "category": null,
           "status": "verified",
-          "n": 13
+          "n": 15
         },
         {
           "category": "automation",
           "status": "cancelled",
-          "n": 38
+          "n": 39
         },
         {
           "category": "automation",
           "status": "claimed",
-          "n": 3
-        },
-        {
-          "category": "automation",
-          "status": "open",
-          "n": 13
-        },
-        {
-          "category": "automation",
-          "status": "submitted",
           "n": 2
         },
         {
           "category": "automation",
+          "status": "open",
+          "n": 14
+        },
+        {
+          "category": "automation",
           "status": "verified",
-          "n": 106
+          "n": 108
         },
         {
           "category": "code",
@@ -404,12 +395,17 @@
         {
           "category": "code",
           "status": "claimed",
-          "n": 2
+          "n": 1
         },
         {
           "category": "code",
           "status": "expired",
           "n": 5
+        },
+        {
+          "category": "code",
+          "status": "open",
+          "n": 1
         },
         {
           "category": "code",
@@ -458,7 +454,7 @@
         },
         {
           "category": "research",
-          "status": "claimed",
+          "status": "open",
           "n": 1
         },
         {
@@ -604,12 +600,12 @@
     {
       "name": "chain_linkage",
       "passed": true,
-      "details": "2140 links checked (sequences 3..2142); 0 broken; sequences 1-2 are the documented dev-era reset seam; checkpoint at sequence 2 matches our entry 2"
+      "details": "2190 links checked (sequences 3..2192); 0 broken; sequences 1-2 are the documented dev-era reset seam; checkpoint at sequence 2 matches our entry 2"
     },
     {
       "name": "chain_hash_recompute",
       "passed": true,
-      "details": "2137 entries verify under the length-prefixed recipe; 5 early entries verify under the pre-migration raw concatenation; 0 unverified"
+      "details": "2187 entries verify under the length-prefixed recipe; 5 early entries verify under the pre-migration raw concatenation; 0 unverified"
     },
     {
       "name": "settled_rows_match_tasks",
@@ -619,17 +615,17 @@
     {
       "name": "receipt_chain_anchors",
       "passed": true,
-      "details": "525 receipts carry a chain anchor; 0 fail to resolve to a chain entry with a matching hash"
+      "details": "528 receipts carry a chain anchor; 0 fail to resolve to a chain entry with a matching hash"
     },
     {
       "name": "status_counts_reconcile",
       "passed": true,
-      "details": "Registry snapshot was taken at crawl start; the board moves during a ~1h polite crawl, so small diffs are expected and itemized: open: registry 13 vs dataset 13; claimed: registry 11 vs dataset 11; submitted: registry 3 vs dataset 3; verified: registry 249 vs dataset 248; cancelled: registry 126 vs dataset 124; expired: registry 8 vs dataset 8"
+      "details": "409 tasks observed in the latest crawl; 0 status mismatch(es); 0 additional historical task(s) retained from earlier crawls (superset accumulation). Registry drift (informational): open: registry@start 16, registry@end 16 vs dataset 16; claimed: registry@start 8, registry@end 8 vs dataset 8; submitted: registry@start 0, registry@end 0 vs dataset 0; verified: registry@start 253, registry@end 253 vs dataset 252; cancelled: registry@start 127, registry@end 127 vs dataset 125; expired: registry@start 8, registry@end 8 vs dataset 8"
     },
     {
       "name": "derived_durations_rule",
       "passed": true,
-      "details": "negative counts: {\"time_to_claim_s\":0,\"delivery_s\":0,\"review_s\":0}; 2 task(s) carry timestamps that straddle two claim cycles (an earlier cycle's timestamp kept on the current record, e.g. a stale submitted_at); their derived durations are NULL by the documented single-cycle rule"
+      "details": "negative counts: {\"time_to_claim_s\":0,\"delivery_s\":0,\"review_s\":0}; 0 task(s) carry timestamps that straddle two claim cycles (an earlier cycle's timestamp kept on the current record, e.g. a stale submitted_at); their derived durations are NULL by the documented single-cycle rule"
     }
   ]
 }

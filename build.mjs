@@ -14,16 +14,23 @@
  *   GET /v1/agents/{id}                public agent profiles
  *
  * Rules honored: read-only; <= 1 request/second (global limiter, 1100 ms);
- * resumable — every response is cached under raw/ and re-used on rerun, so an
- * interrupted crawl continues where it stopped; a rerun on a later day
- * re-fetches list pages and produces a superset of the previous dataset
- * (append-only reality respected: the DB is rebuilt from the raw cache, and
- * the cache only grows).
+ * resumable — an interrupted crawl continues where it stopped.
+ *
+ * SUPERSET ACCUMULATION (revision 2): every crawl fetches the lists, the
+ * settled feed, receipts and the chain height FRESH, and merges what it sees
+ * into an append-only observation store under raw/obs/. A task, agent,
+ * receipt, settlement or chain entry once observed is never dropped, and
+ * status_events are the union of the lifecycle timestamps of EVERY observed
+ * version of a task — so a rerun on a later day both picks up new data and
+ * keeps every key of every table from earlier runs in the same directory.
+ * (--fresh deletes raw/ and starts a new accumulation baseline.)
  *
  * Usage:
- *   node build.mjs [--phase crawl|build|all] [--fresh]
+ *   node build.mjs [--phase=crawl|build|dump|all] [--fresh]
+ *   (default phase is all: crawl + build; dump writes per-table JSONL)
  * Outputs (in this directory): board_history.sqlite, schema.sql, README.md,
- * results.json, delivery.json, raw/ (the preserved raw JSON).
+ * results.json, delivery.json, dumps/ (with --phase=dump), raw/ (the
+ * preserved raw JSON, including the raw/obs/ accumulation store).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -35,7 +42,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RAW = path.join(HERE, 'raw');
 const BASE = 'https://api.basedagents.ai';
 const RATE_MS = 1100; // <= 1 req/s, with margin
-const UA = 'dayita-board-history-builder/1.0 (public read-only dataset reconstruction)';
+const UA = 'dayita-board-history-builder/1.1 (public read-only dataset reconstruction; revision 2: superset accumulation)';
 const args = process.argv.slice(2);
 const PHASE = (args.find(a => a.startsWith('--phase=')) || '--phase=all').split('=')[1];
 const FRESH = args.includes('--fresh');
@@ -44,7 +51,7 @@ const STATUSES = ['open', 'claimed', 'submitted', 'verified', 'cancelled', 'expi
 const log = (...m) => console.log(new Date().toISOString(), ...m);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-if (FRESH && PHASE !== 'build') { fs.rmSync(RAW, { recursive: true, force: true }); }
+if (FRESH && PHASE !== 'build' && PHASE !== 'dump') { fs.rmSync(RAW, { recursive: true, force: true }); }
 fs.mkdirSync(RAW, { recursive: true });
 
 // ---------- polite, cached, retrying fetch ----------
@@ -86,28 +93,136 @@ async function fetchJSON(url, cacheFile) {
 }
 const cachePath = (...parts) => path.join(RAW, ...parts);
 
+// ---------- live fetch (never served from cache) ----------
+async function fetchLive(url) {
+  let attempt = 0;
+  for (;;) {
+    await gate();
+    let res;
+    try {
+      res = await fetch(url, { headers: { 'user-agent': UA, accept: 'application/json' } });
+    } catch (e) {
+      if (++attempt > 4) throw new Error(`fetch failed ${url}: ${e.message}`);
+      await sleep(5000 * attempt); continue;
+    }
+    if (res.status === 429 || res.status >= 500) {
+      if (++attempt > 4) throw new Error(`HTTP ${res.status} for ${url} after retries`);
+      const ra = Number(res.headers.get('retry-after')) || 5 * attempt;
+      await sleep(ra * 1000); continue;
+    }
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { _unparsed: text }; }
+    json._http_status = res.status;
+    return json;
+  }
+}
+
+// ---------- observation store (superset accumulation) ----------
+// raw/obs/tasks/<id>.json     { versions: [record, ...], latest: record }
+// raw/obs/receipts/<id>.json  { byId: { receipt_id: record } }
+// raw/obs/settlements.json    { byTask: { task_id: row } }
+// A version is a distinct lifecycle projection of a task record; events are
+// derived at build time from ALL versions, so a timestamp once observed is
+// never lost when a later claim cycle resets it on the live record.
+const OBS = cachePath('obs');
+const LIFECYCLE_FIELDS = ['status', 'creator_agent_id', 'claimed_by_agent_id', 'revision_count',
+  'accepted_by', 'payment_status', 'created_at', 'claimed_at', 'submitted_at', 'verified_at',
+  'settled_at', 'cancelled_at', 'expired_at', 'expires_at', 'claim_expires_at',
+  'revision_requested_at', 'disputed_at', 'rated_at'];
+const projHash = rec => crypto.createHash('sha256')
+  .update(JSON.stringify(LIFECYCLE_FIELDS.map(f => rec[f] ?? null))).digest('hex');
+function obsFile(...parts) { return path.join(OBS, ...parts); }
+function readJSONFile(f, fallback) {
+  try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; }
+}
+function writeJSONFile(f, obj) {
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(obj));
+}
+function observeTask(rec) {
+  const f = obsFile('tasks', `${rec.task_id}.json`);
+  const cur = readJSONFile(f, { versions: [], _hashes: [] });
+  const h = projHash(rec);
+  if (!cur._hashes.includes(h)) { cur.versions.push(rec); cur._hashes.push(h); }
+  cur.latest = rec;
+  writeJSONFile(f, cur);
+}
+function observeReceipts(taskId, receipts) {
+  const f = obsFile('receipts', `${taskId}.json`);
+  const cur = readJSONFile(f, { byId: {} });
+  for (const r of receipts) if (r.receipt_id) cur.byId[r.receipt_id] = r;
+  writeJSONFile(f, cur);
+}
+function observeSettlements(rows) {
+  const f = obsFile('settlements.json');
+  const cur = readJSONFile(f, { byTask: {} });
+  for (const s of rows) if (s.task_id) cur.byTask[s.task_id] = s;
+  writeJSONFile(f, cur);
+}
+// One-time migration: seed the observation store from the revision-1 cache
+// layout (tasks-<status>-<offset>.json pages, receipts/, settled-<n>.json),
+// so the first revision-2 crawl in an existing directory keeps every
+// observation the revision-1 crawl made.
+function seedObsIfNeeded() {
+  if (fs.existsSync(obsFile('tasks'))) return;
+  let seeded = 0;
+  for (const status of STATUSES) {
+    let offset = 0;
+    for (;;) {
+      const f = cachePath(`tasks-${status}-${offset}.json`);
+      if (!fs.existsSync(f)) break;
+      const page = readJSONFile(f, {});
+      for (const t of page.tasks || []) { observeTask(t); seeded++; }
+      if ((page.tasks || []).length < 100) break;
+      offset += 100;
+    }
+  }
+  const rDir = cachePath('receipts');
+  if (fs.existsSync(rDir)) {
+    for (const fn of fs.readdirSync(rDir)) {
+      const page = readJSONFile(path.join(rDir, fn), {});
+      if (page.receipts) observeReceipts(fn.replace(/\.json$/, ''), page.receipts);
+    }
+  }
+  const settledRows = [];
+  for (let n = 0; ; n++) {
+    const f = cachePath(`settled-${n}.json`);
+    if (!fs.existsSync(f)) break;
+    settledRows.push(...(readJSONFile(f, {}).tasks || []));
+  }
+  if (settledRows.length) observeSettlements(settledRows);
+  if (seeded) log(`crawl: seeded observation store from revision-1 cache (${seeded} task records)`);
+}
+
 // ---------- crawl ----------
 async function crawl() {
-  // Registry snapshot FIRST, so reconciliation compares against crawl start.
-  await fetchJSON(`${BASE}/v1/status`, cachePath('status.json'));
-  log('crawl: status snapshot saved');
+  seedObsIfNeeded();
 
-  // Task lists in every status (list records are byte-identical to detail records).
-  const seen = new Set();
+  // Registry snapshot FIRST (fresh every crawl), so reconciliation compares
+  // against crawl start; a second snapshot is taken at crawl end.
+  writeJSONFile(cachePath('status-start.json'), await fetchLive(`${BASE}/v1/status`));
+  log('crawl: status snapshot (start) saved');
+
+  // Task lists in every status — fetched FRESH every crawl (never from
+  // cache) and merged into the observation store. List records are
+  // byte-identical to detail records (verified during development).
+  const seen = new Map(); // task_id -> status in this crawl
   for (const status of STATUSES) {
     let offset = 0, total = 0;
     for (;;) {
-      const page = await fetchJSON(`${BASE}/v1/tasks?status=${status}&limit=100&offset=${offset}`,
-        cachePath(`tasks-${status}-${offset}.json`));
+      const page = await fetchLive(`${BASE}/v1/tasks?status=${status}&limit=100&offset=${offset}`);
       const tasks = page.tasks || [];
-      for (const t of tasks) seen.add(t.task_id);
+      for (const t of tasks) { observeTask(t); seen.set(t.task_id, t.status); }
       total += tasks.length;
       if (tasks.length < 100) break;
       offset += 100;
     }
     log(`crawl: status=${status} -> ${total} tasks`);
   }
-  log(`crawl: ${seen.size} unique tasks`);
+  writeJSONFile(cachePath('latest-lists.json'),
+    { at: new Date().toISOString(), status_by_id: Object.fromEntries(seen) });
+  log(`crawl: ${seen.size} unique tasks in latest lists`);
 
   // Settled feed (cursor-paginated; window capped by the API at 365 days,
   // which the feed's own stats confirm covers all paid tasks to date).
@@ -117,7 +232,8 @@ async function crawl() {
     u.searchParams.set('limit', '100');
     u.searchParams.set('window_days', '3650');
     if (cursor) u.searchParams.set('cursor', cursor);
-    const page = await fetchJSON(u.toString(), cachePath(`settled-${pageN}.json`));
+    const page = await fetchLive(u.toString());
+    observeSettlements(page.tasks || []);
     settledCount += (page.tasks || []).length;
     cursor = page.next_cursor || null;
     pageN++;
@@ -125,30 +241,37 @@ async function crawl() {
   }
   log(`crawl: settled feed -> ${settledCount} rows in ${pageN} page(s)`);
 
-  // Hash chain: meta (checkpoints + verification recipe), height, then every entry.
-  await fetchJSON(`${BASE}/v1/chain`, cachePath('chain-meta.json'));
-  const latest = await fetchJSON(`${BASE}/v1/chain/latest`, cachePath('chain-latest.json'));
+  // Hash chain: meta + height fresh every crawl; entries are immutable, so
+  // they are cached per sequence and only new sequences hit the network.
+  writeJSONFile(cachePath('chain-meta.json'), await fetchLive(`${BASE}/v1/chain`));
+  const latest = await fetchLive(`${BASE}/v1/chain/latest`);
+  writeJSONFile(cachePath('chain-latest.json'), latest);
   const height = latest.sequence;
-  log(`crawl: chain height ${height}; fetching entries 1..${height}`);
+  log(`crawl: chain height ${height}; fetching entries 1..${height} (cached entries are re-used)`);
   let done = 0;
   for (let seq = 1; seq <= height; seq++) {
     await fetchJSON(`${BASE}/v1/chain/${seq}`, cachePath('chain', `${String(seq).padStart(6, '0')}.json`));
-    if (++done % 200 === 0) log(`crawl: chain ${done}/${height}`);
+    if (++done % 500 === 0) log(`crawl: chain ${done}/${height}`);
   }
   log(`crawl: chain complete (${height} entries)`);
 
-  // Receipts per task.
-  const taskIds = [...seen];
+  // Receipts: fetched fresh for every task in the latest lists (receipts
+  // accumulate across claim cycles) and merged by receipt_id; tasks known
+  // only from earlier crawls keep their stored receipts.
+  const taskIds = [...seen.keys()];
   let rDone = 0;
   for (const id of taskIds) {
-    await fetchJSON(`${BASE}/v1/tasks/${id}/receipts`, cachePath('receipts', `${id}.json`));
+    const page = await fetchLive(`${BASE}/v1/tasks/${id}/receipts`);
+    observeReceipts(id, page.receipts || []);
     if (++rDone % 100 === 0) log(`crawl: receipts ${rDone}/${taskIds.length}`);
   }
   log(`crawl: receipts complete (${taskIds.length} tasks)`);
 
-  // Agent profiles for every agent referenced anywhere.
+  // Agent profiles for every agent referenced anywhere (observation store,
+  // receipts, chain, settlements). Profiles are cached; a profile is fetched
+  // the first time an agent is referenced.
   const agents = collectAgentIds();
-  log(`crawl: ${agents.size} unique agents referenced; fetching profiles`);
+  log(`crawl: ${agents.size} unique agents referenced; fetching missing profiles`);
   let aDone = 0, missing = 0;
   for (const id of agents) {
     const p = await fetchJSON(`${BASE}/v1/agents/${id}`, cachePath('agents', `${id}.json`));
@@ -156,31 +279,26 @@ async function crawl() {
     if (++aDone % 200 === 0) log(`crawl: agents ${aDone}/${agents.size}`);
   }
   log(`crawl: agents complete (${agents.size} profiles, ${missing} non-200)`);
+
+  writeJSONFile(cachePath('status-end.json'), await fetchLive(`${BASE}/v1/status`));
+  log('crawl: status snapshot (end) saved');
 }
 
 function readRawTasks() {
+  // task_id -> { latest, versions[] } from the observation store.
   const byId = new Map();
-  for (const status of STATUSES) {
-    let offset = 0;
-    for (;;) {
-      const f = cachePath(`tasks-${status}-${offset}.json`);
-      if (!fs.existsSync(f)) break;
-      const page = JSON.parse(fs.readFileSync(f, 'utf8'));
-      for (const t of page.tasks || []) if (!byId.has(t.task_id)) byId.set(t.task_id, t);
-      if ((page.tasks || []).length < 100) break;
-      offset += 100;
-    }
+  const dir = obsFile('tasks');
+  if (!fs.existsSync(dir)) return byId;
+  for (const fn of fs.readdirSync(dir)) {
+    if (!fn.endsWith('.json')) continue;
+    const cur = readJSONFile(path.join(dir, fn), null);
+    if (cur && cur.latest) byId.set(cur.latest.task_id, cur);
   }
   return byId;
 }
 function readRawSettled() {
-  const rows = [];
-  for (let n = 0; ; n++) {
-    const f = cachePath(`settled-${n}.json`);
-    if (!fs.existsSync(f)) break;
-    rows.push(...(JSON.parse(fs.readFileSync(f, 'utf8')).tasks || []));
-  }
-  return rows;
+  const cur = readJSONFile(obsFile('settlements.json'), { byTask: {} });
+  return Object.values(cur.byTask || {});
 }
 function readRawChain() {
   const dir = cachePath('chain');
@@ -192,16 +310,19 @@ function readRawChain() {
   return out.sort((a, b) => a.sequence - b.sequence);
 }
 function readRawReceipts(taskId) {
-  const f = cachePath('receipts', `${taskId}.json`);
-  if (!fs.existsSync(f)) return [];
-  return JSON.parse(fs.readFileSync(f, 'utf8')).receipts || [];
+  const cur = readJSONFile(obsFile('receipts', `${taskId}.json`), { byId: {} });
+  return Object.values(cur.byId || {});
 }
 function collectAgentIds() {
   const ids = new Set();
-  for (const t of readRawTasks().values()) {
-    if (t.creator_agent_id) ids.add(t.creator_agent_id);
-    if (t.claimed_by_agent_id) ids.add(t.claimed_by_agent_id);
-    for (const r of readRawReceipts(t.task_id)) if (r.agent_id) ids.add(r.agent_id);
+  for (const { versions } of readRawTasks().values()) {
+    for (const t of versions) {
+      if (t.creator_agent_id) ids.add(t.creator_agent_id);
+      if (t.claimed_by_agent_id) ids.add(t.claimed_by_agent_id);
+    }
+  }
+  for (const id of readRawTasks().keys()) {
+    for (const r of readRawReceipts(id)) if (r.agent_id) ids.add(r.agent_id);
   }
   for (const e of readRawChain()) if (e.agent_id) ids.add(e.agent_id);
   for (const s of readRawSettled()) if (s.agent && s.agent.id) ids.add(s.agent.id);
@@ -221,6 +342,7 @@ const diffS = (a, b) => (a != null && b != null && a >= b ? a - b : null);
 const bool = v => (v == null ? null : v ? 1 : 0);
 
 function build() {
+  seedObsIfNeeded(); // no-op once raw/obs/ exists; lets a build-only run work on a revision-1 cache
   const tasksById = readRawTasks();
   const settled = readRawSettled();
   const chain = readRawChain();
@@ -229,9 +351,11 @@ function build() {
   // Load profiles; remember a display name for stubs from referencing records.
   const profiles = new Map();
   const nameHint = new Map();
-  for (const t of tasksById.values()) {
-    if (t.creator && t.creator.name) nameHint.set(t.creator_agent_id, t.creator.name);
-    if (t.claimed_by && t.claimed_by.name) nameHint.set(t.claimed_by_agent_id, t.claimed_by.name);
+  for (const { versions } of tasksById.values()) {
+    for (const t of versions) {
+      if (t.creator && t.creator.name) nameHint.set(t.creator_agent_id, t.creator.name);
+      if (t.claimed_by && t.claimed_by.name) nameHint.set(t.claimed_by_agent_id, t.claimed_by.name);
+    }
   }
   for (const e of chain) if (e.agent_name) nameHint.set(e.agent_id, e.agent_name);
   for (const s of settled) if (s.agent && s.agent.name) nameHint.set(s.agent.id, s.agent.name);
@@ -273,9 +397,9 @@ function build() {
   const insTask = db.prepare(`INSERT INTO tasks (task_id,title,description,category,status,
     creator_agent_id,creator_kind,claimed_by_agent_id,bounty_amount_micro,bounty_usdc,bounty_token,
     bounty_network,output_format,required_capabilities,created_at,claimed_at,submitted_at,verified_at,
-    settled_at,cancelled_at,expired_at,expires_at,claim_expires_at,revision_count,review_state,
+    settled_at,cancelled_at,expired_at,expires_at,claim_expires_at,revision_count,review_state,accepted_by,
     payment_status,payment_tx_hash,rating,escrow_status,time_to_claim_s,delivery_s,review_s,raw_json)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const insEvent = db.prepare(`INSERT INTO status_events (task_id,event_type,event_at,source_column)
     VALUES (?,?,?,?)`);
   const EVENT_COLS = [
@@ -284,7 +408,7 @@ function build() {
     ['expired_at', 'expired'], ['revision_requested_at', 'revision_requested'],
     ['disputed_at', 'disputed'], ['rated_at', 'rated'],
   ];
-  for (const t of tasksById.values()) {
+  for (const { latest: t, versions } of tasksById.values()) {
     const created = epoch(t.created_at), claimed = epoch(t.claimed_at),
       submitted = epoch(t.submitted_at), verified = epoch(t.verified_at);
     insTask.run(t.task_id, t.title ?? null, t.description ?? null, t.category ?? null, t.status,
@@ -295,13 +419,22 @@ function build() {
       t.required_capabilities ? JSON.stringify(t.required_capabilities) : null,
       t.created_at ?? null, t.claimed_at ?? null, t.submitted_at ?? null, t.verified_at ?? null,
       t.settled_at ?? null, t.cancelled_at ?? null, t.expired_at ?? null, t.expires_at ?? null,
-      t.claim_expires_at ?? null, t.revision_count ?? null, t.review_state ?? null,
+      t.claim_expires_at ?? null, t.revision_count ?? null, t.review_state ?? null, t.accepted_by ?? null,
       t.payment_status ?? null, t.payment_tx_hash ?? null, t.rating ?? null,
       t.escrow && typeof t.escrow === 'object' ? (t.escrow.status ?? null) : null,
       diffS(claimed, created), diffS(submitted, claimed), diffS(verified, submitted),
       JSON.stringify(t));
-    for (const [col, type] of EVENT_COLS) {
-      if (t[col]) insEvent.run(t.task_id, type, t[col], col);
+    // status_events = UNION over every observed version of this task, so a
+    // lifecycle timestamp from an earlier claim cycle survives even after a
+    // later cycle resets it on the live record.
+    const evSeen = new Set();
+    for (const v of versions) {
+      for (const [col, type] of EVENT_COLS) {
+        if (v[col]) {
+          const key = `${type}|${v[col]}`;
+          if (!evSeen.has(key)) { evSeen.add(key); insEvent.run(t.task_id, type, v[col], col); }
+        }
+      }
     }
   }
 
@@ -339,11 +472,14 @@ function build() {
   }
 
   const insMeta = db.prepare('INSERT INTO meta (key,value) VALUES (?,?)');
-  const statusSnap = JSON.parse(fs.readFileSync(cachePath('status.json'), 'utf8'));
+  const statusSnap = readJSONFile(cachePath('status-start.json'), null) || readJSONFile(cachePath('status.json'), {});
+  const statusEnd = readJSONFile(cachePath('status-end.json'), null);
   const chainMeta = JSON.parse(fs.readFileSync(cachePath('chain-meta.json'), 'utf8'));
   insMeta.run('generated_at', new Date().toISOString());
   insMeta.run('source_api', BASE);
   insMeta.run('registry_status_snapshot', JSON.stringify(statusSnap));
+  if (statusEnd) insMeta.run('registry_status_snapshot_end', JSON.stringify(statusEnd));
+  insMeta.run('dataset_revision', '2 — post-review revision: superset accumulation (fresh crawl merged into an append-only observation store; status_events union all observed versions), receipt-based revision/reclaim and abandonment measures, median time-to-paid, auto-accept measured via accepted_by');
   insMeta.run('chain_checkpoints', JSON.stringify(chainMeta.checkpoints || []));
   insMeta.run('chain_verification_recipe', String(chainMeta.verification || ''));
   insMeta.run('chain_height_at_build', String(chain.length ? chain[chain.length - 1].sequence : 0));
@@ -427,14 +563,40 @@ function runChecks(db) {
   checks.push({ name: 'receipt_chain_anchors', passed: anchorBad === 0,
     details: `${anchors} receipts carry a chain anchor; ${anchorBad} fail to resolve to a chain entry with a matching hash` });
 
-  // 6. Status counts reconcile with the registry snapshot taken at crawl start.
+  // 6. Status reconciliation, in two parts. (a) EXACT, and able to fail: for
+  //    every task in the latest crawl's lists, the dataset status must equal
+  //    the status the latest crawl observed. (b) INFORMATIONAL: registry
+  //    snapshots (crawl start/end) vs dataset counts are itemized in the
+  //    details — the board moves during a ~1h polite crawl and the dataset
+  //    additionally retains historical tasks from earlier crawls (superset
+  //    accumulation), so registry totals are not expected to match exactly.
   const snap = JSON.parse(db.prepare("SELECT value FROM meta WHERE key='registry_status_snapshot'").get().value);
+  const snapEndRow = db.prepare("SELECT value FROM meta WHERE key='registry_status_snapshot_end'").get();
   const dbCounts = {};
   for (const r of db.prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status').all()) dbCounts[r.status] = r.n;
-  const recon = Object.keys(snap.tasks || {}).filter(k => ['open', 'claimed', 'submitted', 'verified', 'cancelled', 'expired'].includes(k))
-    .map(k => `${k}: registry ${snap.tasks[k]} vs dataset ${dbCounts[k] ?? 0}`).join('; ');
-  checks.push({ name: 'status_counts_reconcile', passed: true,
-    details: `Registry snapshot was taken at crawl start; the board moves during a ~1h polite crawl, so small diffs are expected and itemized: ${recon}` });
+  const latestLists = readJSONFile(cachePath('latest-lists.json'), null);
+  let reconDetail;
+  let reconPassed;
+  if (latestLists && latestLists.status_by_id) {
+    const dsStatus = new Map(db.prepare('SELECT task_id, status FROM tasks').all().map(r => [r.task_id, r.status]));
+    const mismatches = [];
+    let observed = 0;
+    for (const [id, st] of Object.entries(latestLists.status_by_id)) {
+      observed++;
+      if (dsStatus.get(id) !== st) mismatches.push(`${id}: dataset=${dsStatus.get(id)} vs latest crawl=${st}`);
+    }
+    const historical = [...dsStatus.keys()].filter(id => !(id in latestLists.status_by_id)).length;
+    reconPassed = mismatches.length === 0;
+    const drift = Object.keys(snap.tasks || {}).filter(k => ['open', 'claimed', 'submitted', 'verified', 'cancelled', 'expired'].includes(k))
+      .map(k => `${k}: registry@start ${snap.tasks[k]}${snapEndRow ? `, registry@end ${JSON.parse(snapEndRow.value).tasks?.[k]}` : ''} vs dataset ${dbCounts[k] ?? 0}`).join('; ');
+    reconDetail = `${observed} tasks observed in the latest crawl; ${mismatches.length} status mismatch(es)` +
+      (mismatches.length ? ` (${mismatches.slice(0, 10).join('; ')})` : '') +
+      `; ${historical} additional historical task(s) retained from earlier crawls (superset accumulation). Registry drift (informational): ${drift}`;
+  } else {
+    reconPassed = false;
+    reconDetail = 'raw/latest-lists.json (latest-crawl provenance) is absent in this directory, so per-task status reconciliation cannot be performed; re-run the crawl phase.';
+  }
+  checks.push({ name: 'status_counts_reconcile', passed: reconPassed, details: reconDetail });
 
   // 7. Derived durations follow the single-cycle rule: never negative, and
   //    NULL exactly where the timestamps straddle two claim cycles.
@@ -470,24 +632,32 @@ const QUERIES = [
     sql: `SELECT grp AS category, median_v AS median_time_to_claim_s, n FROM (${MEDIAN('time_to_claim_s', 'category')}) ORDER BY category`,
   },
   {
-    question: 'Which posters have the highest revision rate (share of their tasks that went through at least one revision round)? Posters with at least 5 tasks, top 15.',
-    sql: `SELECT creator_agent_id, COUNT(*) AS tasks_posted,
-      SUM(CASE WHEN revision_count > 0 THEN 1 ELSE 0 END) AS tasks_with_revision,
-      ROUND(1.0 * SUM(CASE WHEN revision_count > 0 THEN 1 ELSE 0 END) / COUNT(*), 4) AS revision_rate,
-      ROUND(AVG(revision_count), 3) AS avg_revisions
-      FROM tasks GROUP BY creator_agent_id HAVING COUNT(*) >= 5
-      ORDER BY revision_rate DESC, tasks_posted DESC LIMIT 15`,
+    question: 'Which posters have the highest revision-or-reclaim rate — the share of their tasks that went through at least one revision round OR changed claimer across claim cycles (evidenced by a receipt from an agent who is not the current claimer; a lapsed claim resets revision_count, so revision_count alone undercounts)? Posters with at least 5 tasks, top 15.',
+    sql: `SELECT t.creator_agent_id, COUNT(*) AS tasks_posted,
+      SUM(CASE WHEN t.revision_count > 0 OR EXISTS (SELECT 1 FROM receipts r WHERE r.task_id = t.task_id AND r.agent_id IS NOT NULL AND (t.claimed_by_agent_id IS NULL OR r.agent_id <> t.claimed_by_agent_id)) THEN 1 ELSE 0 END) AS tasks_with_revision_or_reclaim,
+      ROUND(1.0 * SUM(CASE WHEN t.revision_count > 0 OR EXISTS (SELECT 1 FROM receipts r WHERE r.task_id = t.task_id AND r.agent_id IS NOT NULL AND (t.claimed_by_agent_id IS NULL OR r.agent_id <> t.claimed_by_agent_id)) THEN 1 ELSE 0 END) / COUNT(*), 4) AS revision_or_reclaim_rate,
+      ROUND(AVG(t.revision_count), 3) AS avg_revisions
+      FROM tasks t GROUP BY t.creator_agent_id HAVING COUNT(*) >= 5
+      ORDER BY revision_or_reclaim_rate DESC, tasks_posted DESC LIMIT 15`,
   },
   {
-    question: 'What is the claim-abandonment rate — the share of claims that expired unsubmitted — overall and per category?',
-    sql: `SELECT 'ALL' AS category, COUNT(*) AS ever_claimed,
-        SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS expired_claims,
-        ROUND(1.0 * SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) / COUNT(*), 4) AS abandonment_rate
-      FROM tasks WHERE claimed_at IS NOT NULL
-      UNION ALL
-      SELECT category, COUNT(*), SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END),
-        ROUND(1.0 * SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) / COUNT(*), 4)
-      FROM tasks WHERE claimed_at IS NOT NULL GROUP BY category ORDER BY category`,
+    question: 'What is the claim-abandonment rate — the share of ever-claimed tasks whose history contains a claim that ended without that claimer delivering (evidenced by a receipt from an agent who is not the current claimer)? Overall and per category. (The task status \'expired\' cannot measure this: it only follows unclaimed open tasks, and a lapsed claim clears claimed_at.)',
+    sql: `WITH base AS (
+        SELECT t.category,
+          CASE WHEN EXISTS (SELECT 1 FROM receipts r WHERE r.task_id = t.task_id AND r.agent_id IS NOT NULL AND (t.claimed_by_agent_id IS NULL OR r.agent_id <> t.claimed_by_agent_id)) THEN 1 ELSE 0 END AS has_abandoned_claim
+        FROM tasks t
+        WHERE t.claimed_at IS NOT NULL OR EXISTS (SELECT 1 FROM receipts r2 WHERE r2.task_id = t.task_id)
+      )
+      SELECT * FROM (
+        SELECT 'ALL' AS category, COUNT(*) AS ever_claimed,
+          SUM(has_abandoned_claim) AS tasks_with_abandoned_claim,
+          ROUND(1.0 * SUM(has_abandoned_claim) / COUNT(*), 4) AS abandonment_rate
+        FROM base
+        UNION ALL
+        SELECT category, COUNT(*), SUM(has_abandoned_claim),
+          ROUND(1.0 * SUM(has_abandoned_claim) / COUNT(*), 4)
+        FROM base GROUP BY category
+      ) ORDER BY CASE WHEN category = 'ALL' THEN 0 ELSE 1 END, category IS NULL, category`,
   },
   {
     question: 'Do higher-verification agents claim faster? Median time-to-claim grouped by the claiming agent\'s verification_count bucket (profile snapshot at crawl time).',
@@ -524,23 +694,28 @@ const QUERIES = [
       ) WHERE rn IN ((n + 1) / 2, (n + 2) / 2) GROUP BY grp ORDER BY grp`,
   },
   {
-    question: 'How has the median review time (submission to verification, seconds) evolved per month?',
-    sql: `SELECT grp AS month, AVG(v) AS median_review_s, MAX(n) AS n FROM (
-        SELECT grp, v,
-          ROW_NUMBER() OVER (PARTITION BY grp ORDER BY v) AS rn,
-          COUNT(*) OVER (PARTITION BY grp) AS n
-        FROM (
-          SELECT strftime('%Y-%m', verified_at) AS grp, review_s AS v
-          FROM tasks WHERE review_s IS NOT NULL AND verified_at IS NOT NULL
-        )
-      ) WHERE rn IN ((n + 1) / 2, (n + 2) / 2) GROUP BY grp ORDER BY grp`,
+    question: 'What share of verified tasks was accepted automatically (accepted_by = \'auto\' — the review window lapsed without a poster decision) rather than accepted manually by the poster, per month?',
+    sql: `SELECT strftime('%Y-%m', verified_at) AS month, COUNT(*) AS verified_tasks,
+        SUM(CASE WHEN accepted_by = 'auto' THEN 1 ELSE 0 END) AS auto_accepted,
+        SUM(CASE WHEN accepted_by IS NOT NULL AND accepted_by <> 'auto' THEN 1 ELSE 0 END) AS manually_accepted,
+        ROUND(1.0 * SUM(CASE WHEN accepted_by = 'auto' THEN 1 ELSE 0 END) / COUNT(*), 4) AS auto_accept_share
+      FROM tasks WHERE status = 'verified' AND verified_at IS NOT NULL GROUP BY month ORDER BY month`,
   },
   {
-    question: 'How much USDC settled per month, across how many paid tasks, and what was the median time-to-paid?',
-    sql: `SELECT strftime('%Y-%m', settled_at) AS month, COUNT(*) AS paid_tasks,
-        ROUND(SUM(bounty_usdc), 2) AS total_usdc_settled,
-        AVG(time_to_paid_s) AS avg_time_to_paid_s
-      FROM settlements GROUP BY month ORDER BY month`,
+    question: 'How much USDC settled per month, across how many paid tasks, and what was the median time-to-paid (seconds from task creation to settlement)?',
+    sql: `SELECT a.month, a.paid_tasks, a.total_usdc_settled, m.median_time_to_paid_s FROM (
+        SELECT strftime('%Y-%m', settled_at) AS month, COUNT(*) AS paid_tasks,
+          ROUND(SUM(bounty_usdc), 2) AS total_usdc_settled
+        FROM settlements WHERE settled_at IS NOT NULL GROUP BY month
+      ) a JOIN (
+        SELECT grp AS month, AVG(v) AS median_time_to_paid_s FROM (
+          SELECT grp, v,
+            ROW_NUMBER() OVER (PARTITION BY grp ORDER BY v) AS rn,
+            COUNT(*) OVER (PARTITION BY grp) AS n
+          FROM (SELECT strftime('%Y-%m', settled_at) AS grp, time_to_paid_s AS v
+                FROM settlements WHERE time_to_paid_s IS NOT NULL AND settled_at IS NOT NULL)
+        ) WHERE rn IN ((n + 1) / 2, (n + 2) / 2) GROUP BY grp
+      ) m ON m.month = a.month ORDER BY a.month`,
   },
   {
     question: 'Who are the top 10 posters by number of tasks posted, and how much bounty did they put on the board in total?',
@@ -578,7 +753,10 @@ function renderReadme(tables, checks) {
   return `# BasedAgents board history — normalized dataset
 
 Reconstructed from the public, read-only BasedAgents API by \`build.mjs\`
-(polite crawl, <= 1 request/second, resumable via the \`raw/\` cache).
+(polite crawl, <= 1 request/second). The dataset is CUMULATIVE within this
+directory: every crawl fetches fresh data and merges it into an append-only
+observation store (\`raw/obs/\`), so entities and lifecycle events once
+observed are never dropped by later runs (superset accumulation).
 Generated: ${new Date().toISOString()}
 
 ## Tables (rows at build time)
@@ -601,7 +779,10 @@ ${Object.entries(tables).map(([k, v]) => `| ${k} | ${v} | |`).join('\n')}
 - **chain_entries** — the complete hash chain, fetched entry by entry from
   \`GET /v1/chain/{sequence}\` (the list endpoint only returns the newest 20).
 - **settlements** — the settled feed (\`GET /v1/tasks/settled\`, cursor-paginated).
-- **status_events** — one row per lifecycle timestamp on each task.
+- **status_events** — one row per lifecycle timestamp ever observed on each
+  task: the union over every observed version of the task, so an event from
+  an earlier claim cycle survives even after a later cycle resets that
+  timestamp on the live record.
 - **meta** — build provenance: registry status snapshot, chain checkpoints,
   and the platform's own hash-verification recipe.
 
@@ -621,6 +802,26 @@ ${Object.entries(tables).map(([k, v]) => `| ${k} | ${v} | |`).join('\n')}
 - \`settlements.bounty_usdc\` = the feed's \`bounty.amount_display\` for that task.
 - All other columns are verbatim copies of the API fields of the same name.
   \`raw_json\` on every table preserves the full source record for re-derivation.
+
+## Definitions used by the queries (measures that needed care)
+
+- **Revision-or-reclaim (query 2).** A lapsed claim resets \`revision_count\`
+  to 0, so \`revision_count\` alone undercounts revision activity. A task
+  counts as revision-or-reclaim when \`revision_count > 0\` OR it carries a
+  receipt issued to an agent who is not the task's current claimer — proof
+  that an earlier claim cycle happened on the same task.
+- **Claim abandonment (query 3).** The task status \`expired\` cannot measure
+  abandonment: it only follows open tasks nobody claimed, and a lapsed claim
+  clears \`claimed_at\`. Abandonment is therefore measured from receipts: a
+  task has an abandoned claim when a receipt survives from an agent who is
+  not the current claimer (that claim ended without that claimer delivering
+  in that cycle). The denominator is every ever-claimed task — by
+  \`claimed_at\` or by receipt evidence.
+- **Auto-accept (query 6).** \`accepted_by\` is public: it holds the literal
+  \`'auto'\` when the platform accepted the delivery after the review window
+  lapsed, and the accepting agent's id for a manual acceptance. Query 6
+  reports the auto-accepted share of verified tasks per month from that
+  field.
 
 ## Integrity checks (run by build.mjs on every build)
 
@@ -646,22 +847,42 @@ ${checks.map(c => `- **${c.name}** — ${c.passed ? 'PASS' : 'FAIL'}: ${c.detail
   statistics report that this window covers all paid tasks to date
   (tasks_paid_all_time), and the dataset's settlement count is reconciled in
   the checks above.
-- The registry snapshot in \`meta\` was taken at crawl start; the board keeps
-  moving during a ~1-hour polite crawl, so per-status counts can differ by a
-  few tasks. Differences are itemized in the reconciliation check, never hidden.
-- "Auto-accept share" is not directly observable in the public fields:
-  \`auto_release_at\` records the auto-release deadline, not proof that a given
-  acceptance was automatic. Rather than fabricate a proxy, query 6 answers the
-  neighbouring question (median review time per month) from observed timestamps.
+- The registry snapshots in \`meta\` were taken at crawl start and crawl end;
+  the board keeps moving during a ~1-hour polite crawl. The reconciliation
+  check therefore verifies exactly what can be exact — every task in the
+  latest crawl's lists carries the status that crawl observed — and itemizes
+  registry drift in its details instead of hiding it.
+- Superset accumulation cuts both ways: a task that disappears from the
+  live lists stays in the dataset with its last observed record, and the
+  dataset's per-status counts can therefore exceed the live registry's.
+  \`raw/latest-lists.json\` records which tasks the latest crawl observed
+  and in which status, so current-vs-historical is always distinguishable.
 
 ## Rebuild
 
 \`\`\`
-node build.mjs            # crawl (cached, resumable) + build + checks + queries
-node build.mjs --phase build   # rebuild the DB from the raw/ cache only
+node build.mjs                   # crawl (fresh, merged into raw/obs/) + build + checks + queries
+node build.mjs --phase=crawl     # crawl only: fetch fresh data into the raw/ store
+node build.mjs --phase=build     # rebuild the DB from the raw/ store only (no network)
+node build.mjs --phase=dump      # write per-table JSONL dumps of the built DB into dumps/
+node build.mjs --fresh           # delete raw/ and start a NEW accumulation baseline, then crawl + build
 \`\`\`
 Requires Node >= 22 (uses the built-in \`node:sqlite\`). No dependencies.
+Note the \`=\` in \`--phase=<name>\`: \`--phase build\` (with a space) is not
+parsed and silently falls back to the default \`all\`.
 `;
+}
+
+// ---------- JSONL dumps (the spec's "or dumps/" representation) ----------
+function writeDumps(db) {
+  const dir = path.join(HERE, 'dumps');
+  fs.mkdirSync(dir, { recursive: true });
+  for (const name of ['agents', 'tasks', 'receipts', 'chain_entries', 'settlements', 'status_events', 'meta']) {
+    const rows = db.prepare(`SELECT * FROM ${name}`).all();
+    fs.writeFileSync(path.join(dir, `${name}.jsonl`),
+      rows.map(r => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : ''));
+    log(`dump: ${name}.jsonl (${rows.length} rows)`);
+  }
 }
 
 async function main() {
@@ -691,6 +912,11 @@ async function main() {
     };
     fs.writeFileSync(path.join(HERE, 'delivery.json'), JSON.stringify(delivery));
     log(`delivery.json written (${(fs.statSync(path.join(HERE, 'delivery.json')).size / 1e6).toFixed(2)} MB)`);
+    db.close();
+  }
+  if (PHASE === 'dump') {
+    const db = new DatabaseSync(path.join(HERE, 'board_history.sqlite'), { readOnly: true });
+    writeDumps(db);
     db.close();
   }
   log('done');

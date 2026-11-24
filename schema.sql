@@ -47,6 +47,7 @@ CREATE TABLE tasks (
   claim_expires_at    TEXT,
   revision_count      INTEGER,
   review_state        TEXT,
+  accepted_by         TEXT, -- who accepted the delivery: an agent_id (manual acceptance) or the literal 'auto' (review window lapsed)
   payment_status      TEXT,
   payment_tx_hash     TEXT,
   rating              REAL,
